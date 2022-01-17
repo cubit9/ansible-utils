@@ -1,0 +1,202 @@
+#!/bin/bash
+# Runs a playbook in a project (for cron)
+
+# Add ARA to PYTHONPATH
+export PYTHONPATH=$PYTHONPATH:/opt/ansible/tools/ara
+
+# Set ANSIBLEUTILSDIR
+ANSIBLEUTILSDIR="$(dirname `readlink -f $(which $0)`)"
+
+# Load GPG agent's soocket if it isn't there
+[ -z "$SSH_AUTH_SOCK" ] && export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)
+
+# Defaults
+PROJECTDIR=/opt/ansible/projects
+PLAYBOOKDIR=playbooks
+UPDATE_ROLES=false
+OLD_ANSIBLE=true
+UPDATE_GIT=false
+SWITCH_BRANCHES=false
+IGNORE_LOCK=false
+SPARSE=false
+DISABLE_EXTENDED_ARA_INFO=false
+INVENTORY=""
+DEFAULT_BRANCH=master
+ANSIBLE_VAULT_PASSWORD_FILE=.ansible-vault
+
+# Override any defaults that are set by the user
+test -f $HOME/.runansible.conf && . $HOME/.runansible.conf
+
+usage="Usage: $0 [-p project] [-i inventory] [-s] playbook.yml [ansible-playbook args]
+
+    -A           Disable ARA logging
+    -b branch    Run on specific git branch
+                 When using this option, the script will check out the specified
+                 git branch, run Ansible and then check out $DEFAULT_BRANCH
+    -c           Tell ansible-galaxy to ignore SSL errors when downloading
+                 roles/collections
+    -g           Update git checkout before running
+    -l           Ignore locks and allow for multiple instances of $(basename $0)
+    -p project   Name of the project to run the playbook from
+    -i project   Name of the inventory to use, can be provided multiple times
+    -r           Search for requirements.yml and update roles/collections
+    -s           Make Ansible's output sparse
+    -h           This text
+
+By default, this script will attempt to exclusively lock the playbook that is executed.
+This is to prevent multiple runs of the same playbook at once.
+"
+
+BRANCH=$DEFAULT_BRANCH
+GALAXY_OPTS=''
+
+while getopts "Ab:glhi:p:srR" opt; do
+  case ${opt} in
+    A)
+      DISABLE_EXTENDED_ARA_INFO=true
+      ARA_API_SERVER=http://noara.example.com
+      ;;
+    b)
+      BRANCH="$OPTARG"
+      SWITCH_BRANCHES=true
+      ;;
+    c)
+      GALAXY_OPTS='-c'
+      ;;
+    g)
+      UPDATE_GIT=true
+      ;;
+    l)
+      IGNORE_LOCK=true
+      ;;
+    p)
+      PROJECT="$OPTARG"
+      ;;
+    i)
+      INVENTORY="${INVENTORY} -i $OPTARG"
+      ;;
+    s)
+      export ANSIBLE_DISPLAY_FAILED_STDERR=true
+      export ANSIBLE_DISPLAY_OK_HOSTS=false
+      export ANSIBLE_DISPLAY_SKIPPED_HOSTS=false
+      export SPARSE=true
+      ;;
+    r)
+      UPDATE_ROLES=true
+      ;;
+    h)
+      echo -e "$usage"
+      exit 0
+      ;;
+  esac
+done
+
+shift $[$OPTIND -1]
+PLAYBOOK=$1
+shift 1
+
+[ -z "$PROJECT" ] || [ -z "$PLAYBOOK" ] && echo "$usage" && exit 1
+
+if [ ! -d "$PROJECTDIR/$PROJECT" ]
+then
+  echo "ERROR: Project does not exist!"
+  exit 1
+fi
+
+cd $PROJECTDIR/$PROJECT
+
+if [ ! -f "$PLAYBOOKDIR/$PLAYBOOK" ]
+then
+  echo "ERROR: Playbook does not exist!"
+  exit 1
+fi
+
+test -f $ANSIBLE_VAULT_PASSWORD_FILE && export ANSIBLE_VAULT_PASSWORD_FILE
+
+# check for update_checkout and use that if it's present
+if $UPDATE_GIT
+then
+  if ! $SWITCH_BRANCHES
+  then
+    unset BRANCH
+  fi
+  if [ -x scripts/update_checkout.sh ]
+  then
+    if $SPARSE
+    then
+      scripts/update_checkout.sh $BRANCH > /dev/null 2>&1
+    else
+      scripts/update_checkout.sh $BRANCH
+    fi
+  else
+    if $SPARSE
+    then
+      git pull >/dev/null 2>&1
+    else
+      git pull
+    fi
+  fi
+fi
+
+if $UPDATE_ROLES
+then
+  ANSIBLE_VER=$(ansible --version | head -n1 | cut -d' ' -f2)
+  if [ "$(printf "2.10.0\n$ANSIBLE_VER" | sort -V | head -n 1)" == "2.10.0" ]
+  then
+    OLD_ANSIBLE=false
+  fi
+
+  REQUIREMENTS=$(find . -name requirements.yml -not -path './collections/*' -not -path './roles/*/*' -print | sed 's/^/-r /' | xargs)
+  if [ -n "$REQUIREMENTS" ]
+  then
+    if $SPARSE
+    then
+      ansible-galaxy $GALAXY_OPTS install --ignore-errors -f $REQUIREMENTS >/dev/null 2>&1
+      $OLD_ANSIBLE && ansible-galaxy $GALAXY_OPTS collection install --ignore-errors -f $REQUIREMENTS >/dev/null 2>&1
+    else
+      ansible-galaxy $GALAXY_OPTS install --ignore-errors -f $REQUIREMENTS | egrep -v '[Dd]ownloading|changing|extracting|Installing|Process'
+      $OLD_ANSIBLE && ansible-galaxy $GALAXY_OPTS collection install --ignore-errors -f $REQUIREMENTS | egrep -v '[Dd]ownloading|changing|extracting|Installing|Process'
+    fi
+  fi
+fi
+
+if $SWITCH_BRANCHES
+then
+  git checkout $BRANCH >/dev/null 2>&1
+fi
+
+LOCK_CMD="flock -n -x -E 66 $PLAYBOOKDIR/$PLAYBOOK "
+if $IGNORE_LOCK
+then
+  echo "WARNING: Ignoring locking and starting concurrent run
+
+Current active branch: $(git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/')
+"
+  LOCK_CMD=""
+fi
+
+if ! $DISABLE_EXTENDED_ARA_INFO
+then
+  # Generate temporary ephemeral playbook and execute it
+  cat $ANSIBLEUTILSDIR/ara_info.yml $PLAYBOOKDIR/$PLAYBOOK > $PLAYBOOKDIR/.$$.$PLAYBOOK
+  sed -i 's/^---$//' $PLAYBOOKDIR/.$$.$PLAYBOOK
+  $LOCK_CMD ansible-playbook $INVENTORY -e ara_playbook_dir="$PROJECTDIR/$PROJECT/$PLAYBOOKDIR" -e ara_playbook_name="'$PROJECT - $(git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/') - $PLAYBOOK'" --diff $PLAYBOOKDIR/.$$.$PLAYBOOK "$@"
+  rm $PLAYBOOKDIR/.$$.$PLAYBOOK
+else
+  $LOCK_CMD ansible-playbook $INVENTORY -e ara_playbook_dir="$PROJECTDIR/$PROJECT/$PLAYBOOKDIR" -e ara_playbook_name="'$PROJECT - $(git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/') - $PLAYBOOK'" --diff $PLAYBOOKDIR/$PLAYBOOK "$@"
+fi
+
+
+if [ $? -eq 66 ]
+then
+  echo "ERROR: Unable to acquire lock
+  Project:               $PROJECT
+  Playbook:              $PLAYBOOK
+  Current active branch: $(git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/\1/')
+Please try again later..."
+fi
+
+if $SWITCH_BRANCHES
+then
+  git checkout $DEFAULT_BRANCH >/dev/null 2>&1
+fi
